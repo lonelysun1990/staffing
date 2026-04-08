@@ -53,6 +53,13 @@ export interface AgentResponse {
   data_changed: boolean;
 }
 
+export type AgentStreamEvent =
+  | { type: "text_delta"; delta: string }
+  | { type: "tool_call_start"; tool_call_id: string; name: string; args: Record<string, unknown> }
+  | { type: "tool_result"; tool_call_id: string; name: string; result: string; ok: boolean }
+  | { type: "done"; data_changed: boolean }
+  | { type: "error"; message: string };
+
 export const api = {
   // Auth
   login: async (username: string, password: string): Promise<{ access_token: string; token_type: string }> => {
@@ -151,6 +158,34 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ messages }),
     }),
+
+  async *streamAgentMessage(messages: ChatMessage[]): AsyncGenerator<AgentStreamEvent> {
+    const response = await fetch(`${API_BASE}/agent/chat/stream`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+      body: JSON.stringify({ messages }),
+    });
+    if (!response.ok) {
+      let detail = response.statusText;
+      try { const d = await response.json(); detail = d.detail ?? detail; } catch {}
+      throw new Error(detail);
+    }
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop()!; // keep incomplete tail for next chunk
+      for (const part of parts) {
+        const line = part.trim();
+        if (!line.startsWith("data: ")) continue;
+        try { yield JSON.parse(line.slice(6)) as AgentStreamEvent; } catch { /* skip malformed */ }
+      }
+    }
+  },
 
 
   importSchedule: async (file: File): Promise<ImportResult> => {

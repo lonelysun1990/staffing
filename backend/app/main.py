@@ -46,7 +46,7 @@ from .models import (
     Project,
     ProjectCreate,
 )
-from .agent import AgentRequest, AgentResponse, run_agent
+from .agent import AgentRequest, AgentResponse, run_agent, run_agent_stream
 from .seed_db import seed
 
 
@@ -320,6 +320,16 @@ async def import_json(file: UploadFile = File(...), db: Session = Depends(get_db
 @app.post("/agent/chat", response_model=AgentResponse)
 def agent_chat(request: AgentRequest, db: Session = Depends(get_db)) -> AgentResponse:
     return run_agent(request, db)
+
+
+@app.post("/agent/chat/stream")
+async def agent_chat_stream(request: AgentRequest, db: Session = Depends(get_db)) -> StreamingResponse:
+    """Streaming SSE endpoint. Events: text_delta, tool_call_start, tool_result, done, error."""
+    return StreamingResponse(
+        run_agent_stream(request, db),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/import/schedule", response_model=ImportResult)

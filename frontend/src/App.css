@@ -1156,3 +1156,106 @@ button.ghost.danger {
   cursor: not-allowed;
 }
 
+/* ── Tool steps (inline agent transparency) ─────────────────────────────── */
+
+.tool-step {
+  align-self: flex-start;
+  width: 92%;
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+  font-size: 12px;
+  overflow: hidden;
+  margin: 2px 0;
+}
+
+.tool-step--error {
+  border-color: #fecaca;
+  background: #fff1f2;
+}
+
+.tool-step__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 10px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  font-size: 12px;
+  font-family: inherit;
+  color: #475569;
+}
+
+.tool-step__header:hover {
+  background: rgba(0, 0, 0, 0.03);
+}
+
+.tool-step__icon {
+  font-size: 11px;
+  color: #059669;
+  width: 14px;
+  flex-shrink: 0;
+  text-align: center;
+}
+
+.tool-step__icon--spinning {
+  color: #94a3b8;
+  animation: spin 1.2s linear infinite;
+}
+
+.tool-step--error .tool-step__icon {
+  color: #dc2626;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+.tool-step__name {
+  flex: 1;
+  font-weight: 500;
+  color: #334155;
+}
+
+.tool-step__chevron {
+  color: #94a3b8;
+  font-size: 10px;
+}
+
+.tool-step__body {
+  border-top: 1px solid #e2e8f0;
+  padding: 6px 10px 8px;
+}
+
+.tool-step__result {
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #334155;
+  font-size: 11px;
+  font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+  margin: 0;
+  line-height: 1.5;
+}
+
+/* ── Streaming cursor ───────────────────────────────────────────────────── */
+
+.streaming-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 0.9em;
+  background: #6366f1;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  border-radius: 1px;
+  animation: blink 0.9s step-end infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+
