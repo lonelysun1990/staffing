@@ -262,11 +262,16 @@ button.ghost.danger {
   padding: 16px;
 }
 
+.gantt-scroll-area {
+  overflow: auto;
+  max-height: 70vh;
+}
+
 .gantt-chart {
-  overflow-x: auto;
   display: flex;
   flex-direction: column;
   gap: 2px;
+  min-width: max-content;
 }
 
 .gantt-header,
@@ -278,6 +283,7 @@ button.ghost.danger {
 .gantt-header {
   position: sticky;
   top: 0;
+  z-index: 1;
   background: #f3f4f6;
   border-radius: 8px 8px 0 0;
   font-weight: 600;

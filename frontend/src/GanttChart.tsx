@@ -483,6 +483,7 @@ export function GanttChart({
   return (
     <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
       <div className="gantt-container">
+        <div className="gantt-scroll-area">
         <div className="gantt-chart">
           <div className="gantt-header">
             <div className="gantt-label-cell">
@@ -590,6 +591,7 @@ export function GanttChart({
             );
           })}
         </div>
+        </div>{/* gantt-scroll-area */}
 
         <div className="gantt-legend">
           <span className="gantt-legend-title">
