@@ -12,7 +12,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, backref
 
 from .database import Base
 
@@ -122,3 +122,49 @@ class AuditLogORM(Base):
     details = Column(Text, nullable=True)  # JSON string of what changed
 
     assignment = relationship("AssignmentORM", back_populates="audit_logs")
+
+
+class ChatSessionORM(Base):
+    __tablename__ = "chat_sessions"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    user_id         = Column(Integer, ForeignKey("users.id"), nullable=True)
+    title           = Column(String, nullable=True)
+    created_at      = Column(String, nullable=False)
+    updated_at      = Column(String, nullable=False)
+    message_count   = Column(Integer, nullable=False, default=0)
+    context_summary = Column(Text, nullable=True)
+
+    messages = relationship(
+        "ChatMessageORM", back_populates="session",
+        cascade="all, delete-orphan", order_by="ChatMessageORM.id"
+    )
+
+
+class ChatMessageORM(Base):
+    __tablename__ = "chat_messages"
+
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(Integer, ForeignKey("chat_sessions.id"), nullable=False)
+    role       = Column(String, nullable=False)   # "user" | "assistant" | "tool"
+    content    = Column(Text, nullable=True)
+    meta       = Column("metadata", Text, nullable=True)  # JSON: tool_calls or {tool_call_id, name}
+    created_at = Column(String, nullable=False)
+
+    session = relationship("ChatSessionORM", back_populates="messages")
+
+
+class AgentMemoryORM(Base):
+    __tablename__ = "agent_memories"
+
+    id                = Column(Integer, primary_key=True, autoincrement=True)
+    user_id           = Column(Integer, ForeignKey("users.id"), nullable=True)
+    category          = Column(String, nullable=False)   # "preference" | "habit" | "note"
+    key               = Column(String, nullable=False)
+    value             = Column(Text, nullable=False)
+    source_session_id = Column(Integer, ForeignKey("chat_sessions.id"), nullable=True)
+    confidence        = Column(Integer, nullable=False, default=3)  # 1–5
+    created_at        = Column(String, nullable=False)
+    updated_at        = Column(String, nullable=False)
+
+    __table_args__ = (UniqueConstraint("user_id", "key"),)

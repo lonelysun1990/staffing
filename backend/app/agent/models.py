@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 from pydantic import BaseModel
 
@@ -12,6 +12,7 @@ class ChatMessage(BaseModel):
 
 class AgentRequest(BaseModel):
     messages: List[ChatMessage]
+    session_id: Optional[int] = None   # None = stateless (backward-compatible)
 
 
 class AgentResponse(BaseModel):

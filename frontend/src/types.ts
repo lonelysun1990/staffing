@@ -98,3 +98,28 @@ export interface AuditLogItem {
   changed_at: string;
   details: Record<string, unknown> | null;
 }
+
+export interface ChatSession {
+  id: number;
+  title: string | null;
+  created_at: string;
+  updated_at: string;
+  message_count: number;
+}
+
+export interface ChatMessageOut {
+  id: number;
+  role: string;
+  content: string | null;
+  metadata: Record<string, unknown> | null;
+  created_at: string;
+}
+
+export interface MemoryItem {
+  id: number;
+  category: string;
+  key: string;
+  value: string;
+  confidence: number;
+  updated_at: string;
+}

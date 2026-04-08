@@ -317,6 +317,67 @@ TOOLS: list[dict] = [
             },
         },
     },
+    # ------------------------------------------------------------------ #
+    # Long-term memory tools
+    # ------------------------------------------------------------------ #
+    {
+        "type": "function",
+        "function": {
+            "name": "remember_fact",
+            "description": (
+                "Store a user preference, habit, or note for future sessions. "
+                "Use when the user states a general preference or when you observe a repeating pattern. "
+                "Examples: 'user prefers 50% default allocation', 'user always assigns Yunxuan to ML projects'. "
+                "If a memory with this key already exists, it is updated."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": ["preference", "habit", "note"],
+                        "description": "Type of memory: preference=how the user likes things done, habit=observed pattern, note=misc fact",
+                    },
+                    "key": {
+                        "type": "string",
+                        "description": "Short identifier for this memory, e.g. 'default_allocation' or 'yunxuan_ml_affinity'",
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "The fact or preference to remember, in plain English",
+                    },
+                    "confidence": {
+                        "type": "integer",
+                        "description": "How certain you are this is a lasting preference (1=low, 5=high). Default 3.",
+                        "minimum": 1,
+                        "maximum": 5,
+                    },
+                },
+                "required": ["category", "key", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_memories",
+            "description": (
+                "Retrieve all stored long-term memories about the user's preferences and habits. "
+                "Call this at the start of a new session or when you need to recall past context."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": ["string", "null"],
+                        "enum": ["preference", "habit", "note", None],
+                        "description": "Filter by category, or null/omit for all memories",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 # Tools that do not modify data — used by the loop to decide whether to set data_changed=True.
@@ -324,4 +385,5 @@ READ_ONLY_TOOLS: frozenset[str] = frozenset({
     "get_availability",
     "check_conflicts",
     "suggest_data_scientists",
+    "list_memories",
 })

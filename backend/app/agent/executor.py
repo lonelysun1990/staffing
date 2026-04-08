@@ -26,6 +26,7 @@ from ..models import (
     ProjectCreate,
     ProjectWeek,
 )
+from ..orm_models import AgentMemoryORM
 from .tools import READ_ONLY_TOOLS  # re-exported for loop.py convenience
 
 
@@ -423,8 +424,64 @@ def _execute_create_project(
 # ---------------------------------------------------------------------------
 # Dispatch table — add new tools here
 # ---------------------------------------------------------------------------
+# Long-term memory tools
+# ---------------------------------------------------------------------------
 
-def _dispatch_tool(fn_name: str, args: dict, db: Session) -> str:
+def _execute_remember_fact(
+    db: Session,
+    user_id: Optional[int],
+    category: str,
+    key: str,
+    value: str,
+    confidence: int = 3,
+) -> str:
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    existing = (
+        db.query(AgentMemoryORM)
+        .filter(AgentMemoryORM.user_id == user_id, AgentMemoryORM.key == key)
+        .first()
+    )
+    if existing:
+        existing.category = category
+        existing.value = value
+        existing.confidence = confidence
+        existing.updated_at = now
+    else:
+        db.add(AgentMemoryORM(
+            user_id=user_id,
+            category=category,
+            key=key,
+            value=value,
+            confidence=confidence,
+            created_at=now,
+            updated_at=now,
+        ))
+    db.commit()
+    return f"OK: Remembered [{category}] '{key}': {value}"
+
+
+def _execute_list_memories(
+    db: Session,
+    user_id: Optional[int],
+    category: Optional[str] = None,
+) -> str:
+    q = db.query(AgentMemoryORM).filter(AgentMemoryORM.user_id == user_id)
+    if category:
+        q = q.filter(AgentMemoryORM.category == category)
+    memories = q.order_by(AgentMemoryORM.category, AgentMemoryORM.key).all()
+    if not memories:
+        return "OK: No memories stored yet."
+    lines = [
+        f"[{m.category}] {m.key}: {m.value} (confidence={m.confidence})"
+        for m in memories
+    ]
+    return "OK:\n" + "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+
+def _dispatch_tool(fn_name: str, args: dict, db: Session, user_id: Optional[int] = None) -> str:
     """Route a tool call to the appropriate execute function."""
     match fn_name:
         case "set_assignment":
@@ -468,5 +525,12 @@ def _dispatch_tool(fn_name: str, args: dict, db: Session) -> str:
                 db, args["name"], args["start_date"], args["end_date"],
                 args.get("required_skills"),
             )
+        case "remember_fact":
+            return _execute_remember_fact(
+                db, user_id, args["category"], args["key"], args["value"],
+                args.get("confidence", 3),
+            )
+        case "list_memories":
+            return _execute_list_memories(db, user_id, args.get("category"))
         case _:
             return f"ERROR: Unknown tool '{fn_name}'"

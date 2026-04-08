@@ -12,7 +12,7 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 
 from . import storage
@@ -37,16 +37,23 @@ from .models import (
     AuditLogItem,
     BulkAssignPayload,
     BulkRemovePayload,
+    ChatMessageOut,
+    ChatSessionDetail,
+    ChatSessionSummary,
     ConfigModel,
     ConfigUpdate,
     ConflictItem,
     DataScientist,
     DataScientistCreate,
     ImportResult,
+    MemoryItem,
     Project,
     ProjectCreate,
+    SessionPatch,
 )
+from .orm_models import AgentMemoryORM, ChatSessionORM, ChatMessageORM
 from .agent import AgentRequest, AgentResponse, run_agent, run_agent_stream
+from .agent.chat_storage import create_session, get_session
 from .seed_db import seed
 
 
@@ -323,13 +330,176 @@ def agent_chat(request: AgentRequest, db: Session = Depends(get_db)) -> AgentRes
 
 
 @app.post("/agent/chat/stream")
-async def agent_chat_stream(request: AgentRequest, db: Session = Depends(get_db)) -> StreamingResponse:
+async def agent_chat_stream(
+    request: AgentRequest,
+    db: Session = Depends(get_db),
+    current_user: Optional[UserORM] = Depends(get_user_or_none),
+) -> StreamingResponse:
     """Streaming SSE endpoint. Events: text_delta, tool_call_start, tool_result, done, error."""
     return StreamingResponse(
-        run_agent_stream(request, db),
+        run_agent_stream(request, db, user_id=current_user.id if current_user else None),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ---------------------------------------------------------------------------
+# Chat session routes
+# ---------------------------------------------------------------------------
+
+@app.get("/sessions", response_model=List[ChatSessionSummary])
+def list_sessions(
+    db: Session = Depends(get_db),
+    current_user: Optional[UserORM] = Depends(get_user_or_none),
+) -> List[ChatSessionSummary]:
+    user_id = current_user.id if current_user else None
+    q = db.query(ChatSessionORM).filter(ChatSessionORM.user_id == user_id)
+    rows = q.order_by(ChatSessionORM.updated_at.desc()).all()
+    return [
+        ChatSessionSummary(
+            id=r.id, title=r.title, created_at=r.created_at,
+            updated_at=r.updated_at, message_count=r.message_count,
+        )
+        for r in rows
+    ]
+
+
+@app.post("/sessions", response_model=ChatSessionDetail, status_code=201)
+def new_session(
+    db: Session = Depends(get_db),
+    current_user: Optional[UserORM] = Depends(get_user_or_none),
+) -> ChatSessionDetail:
+    user_id = current_user.id if current_user else None
+    s = create_session(db, user_id)
+    return ChatSessionDetail(
+        id=s.id, title=s.title, created_at=s.created_at,
+        updated_at=s.updated_at, message_count=s.message_count,
+        context_summary=s.context_summary,
+    )
+
+
+@app.get("/sessions/{session_id}", response_model=ChatSessionDetail)
+def get_session_detail(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: Optional[UserORM] = Depends(get_user_or_none),
+) -> ChatSessionDetail:
+    user_id = current_user.id if current_user else None
+    s = get_session(db, session_id, user_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return ChatSessionDetail(
+        id=s.id, title=s.title, created_at=s.created_at,
+        updated_at=s.updated_at, message_count=s.message_count,
+        context_summary=s.context_summary,
+    )
+
+
+@app.patch("/sessions/{session_id}", response_model=ChatSessionDetail)
+def rename_session(
+    session_id: int,
+    body: SessionPatch,
+    db: Session = Depends(get_db),
+    current_user: Optional[UserORM] = Depends(get_user_or_none),
+) -> ChatSessionDetail:
+    user_id = current_user.id if current_user else None
+    s = get_session(db, session_id, user_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    s.title = body.title
+    db.commit()
+    return ChatSessionDetail(
+        id=s.id, title=s.title, created_at=s.created_at,
+        updated_at=s.updated_at, message_count=s.message_count,
+        context_summary=s.context_summary,
+    )
+
+
+@app.delete("/sessions/{session_id}", status_code=204, response_class=Response)
+def delete_session(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: Optional[UserORM] = Depends(get_user_or_none),
+) -> Response:
+    user_id = current_user.id if current_user else None
+    s = get_session(db, session_id, user_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    db.delete(s)
+    db.commit()
+    return Response(status_code=204)
+
+
+@app.get("/sessions/{session_id}/messages", response_model=List[ChatMessageOut])
+def get_session_messages(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: Optional[UserORM] = Depends(get_user_or_none),
+) -> List[ChatMessageOut]:
+    user_id = current_user.id if current_user else None
+    s = get_session(db, session_id, user_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    import json as _json
+    rows = (
+        db.query(ChatMessageORM)
+        .filter(ChatMessageORM.session_id == session_id)
+        .order_by(ChatMessageORM.id)
+        .all()
+    )
+    return [
+        ChatMessageOut(
+            id=r.id,
+            role=r.role,
+            content=r.content,
+            metadata=_json.loads(r.meta) if r.meta else None,
+            created_at=r.created_at,
+        )
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Memory routes
+# ---------------------------------------------------------------------------
+
+@app.get("/memories", response_model=List[MemoryItem])
+def list_memories(
+    db: Session = Depends(get_db),
+    current_user: Optional[UserORM] = Depends(get_user_or_none),
+) -> List[MemoryItem]:
+    user_id = current_user.id if current_user else None
+    rows = (
+        db.query(AgentMemoryORM)
+        .filter(AgentMemoryORM.user_id == user_id)
+        .order_by(AgentMemoryORM.category, AgentMemoryORM.key)
+        .all()
+    )
+    return [
+        MemoryItem(
+            id=r.id, category=r.category, key=r.key,
+            value=r.value, confidence=r.confidence, updated_at=r.updated_at,
+        )
+        for r in rows
+    ]
+
+
+@app.delete("/memories/{memory_id}", status_code=204, response_class=Response)
+def delete_memory(
+    memory_id: int,
+    db: Session = Depends(get_db),
+    current_user: Optional[UserORM] = Depends(get_user_or_none),
+) -> Response:
+    user_id = current_user.id if current_user else None
+    m = db.query(AgentMemoryORM).filter(
+        AgentMemoryORM.id == memory_id,
+        AgentMemoryORM.user_id == user_id,
+    ).first()
+    if m is None:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    db.delete(m)
+    db.commit()
+    return Response(status_code=204)
 
 
 @app.post("/import/schedule", response_model=ImportResult)

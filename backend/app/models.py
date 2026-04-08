@@ -147,3 +147,40 @@ class BulkRemovePayload(BaseModel):
     week_start: Optional[date] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
+
+
+# ---------------------------------------------------------------------------
+# Chat session models
+# ---------------------------------------------------------------------------
+
+class ChatSessionSummary(BaseModel):
+    id: int
+    title: Optional[str]
+    created_at: str
+    updated_at: str
+    message_count: int
+
+
+class ChatSessionDetail(ChatSessionSummary):
+    context_summary: Optional[str]
+
+
+class SessionPatch(BaseModel):
+    title: str
+
+
+class ChatMessageOut(BaseModel):
+    id: int
+    role: str
+    content: Optional[str]
+    metadata: Optional[dict]
+    created_at: str
+
+
+class MemoryItem(BaseModel):
+    id: int
+    category: str
+    key: str
+    value: str
+    confidence: int
+    updated_at: str

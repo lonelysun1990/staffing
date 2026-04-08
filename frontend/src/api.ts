@@ -4,11 +4,14 @@ import {
   AuditLogItem,
   BulkAssignPayload,
   BulkRemovePayload,
+  ChatMessageOut,
+  ChatSession,
   Config,
   ConflictItem,
   DataScientist,
   DataScientistPayload,
   ImportResult,
+  MemoryItem,
   Project,
   ProjectPayload,
 } from "./types";
@@ -57,7 +60,7 @@ export type AgentStreamEvent =
   | { type: "text_delta"; delta: string }
   | { type: "tool_call_start"; tool_call_id: string; name: string; args: Record<string, unknown> }
   | { type: "tool_result"; tool_call_id: string; name: string; result: string; ok: boolean }
-  | { type: "done"; data_changed: boolean }
+  | { type: "done"; data_changed: boolean; session_id: number | null }
   | { type: "error"; message: string };
 
 export const api = {
@@ -159,11 +162,11 @@ export const api = {
       body: JSON.stringify({ messages }),
     }),
 
-  async *streamAgentMessage(messages: ChatMessage[]): AsyncGenerator<AgentStreamEvent> {
+  async *streamAgentMessage(messages: ChatMessage[], sessionId?: number): AsyncGenerator<AgentStreamEvent> {
     const response = await fetch(`${API_BASE}/agent/chat/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...getAuthHeaders() },
-      body: JSON.stringify({ messages }),
+      body: JSON.stringify({ messages, session_id: sessionId ?? null }),
     });
     if (!response.ok) {
       let detail = response.statusText;
@@ -187,6 +190,18 @@ export const api = {
     }
   },
 
+
+  // Sessions
+  listSessions: (): Promise<ChatSession[]> => request("/sessions"),
+  deleteSession: (id: number): Promise<void> => request(`/sessions/${id}`, { method: "DELETE" }),
+  renameSession: (id: number, title: string): Promise<ChatSession> =>
+    request(`/sessions/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }),
+  getSessionMessages: (id: number): Promise<ChatMessageOut[]> =>
+    request(`/sessions/${id}/messages`),
+
+  // Memories
+  listMemories: (): Promise<MemoryItem[]> => request("/memories"),
+  deleteMemory: (id: number): Promise<void> => request(`/memories/${id}`, { method: "DELETE" }),
 
   importSchedule: async (file: File): Promise<ImportResult> => {
     const formData = new FormData();

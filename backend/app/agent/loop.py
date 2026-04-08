@@ -13,6 +13,14 @@ from typing import AsyncGenerator, Optional
 
 from sqlalchemy.orm import Session
 
+from .chat_storage import (
+    auto_title_session,
+    create_session,
+    get_session,
+    load_session_messages,
+    maybe_summarize,
+    save_message,
+)
 from .context import build_system_prompt
 from .executor import _dispatch_tool
 from .models import AgentRequest, AgentResponse
@@ -82,21 +90,26 @@ def run_agent(request: AgentRequest, db: Session) -> AgentResponse:
 # Async streaming loop (new — /agent/chat/stream)
 # ---------------------------------------------------------------------------
 
-async def run_agent_stream(request: AgentRequest, db: Session) -> AsyncGenerator[str, None]:
+async def run_agent_stream(
+    request: AgentRequest,
+    db: Session,
+    user_id: Optional[int] = None,
+) -> AsyncGenerator[str, None]:
     """
-    Agentic loop with SSE streaming.
+    Agentic loop with SSE streaming and optional session persistence.
+
+    When request.session_id is set, the conversation is loaded from DB and
+    each turn is saved incrementally. When None, stateless behavior is used
+    (identical to the original implementation).
 
     Yields SSE-formatted strings. The loop continues calling the model until it
     produces a text-only reply (no tool calls), or until MAX_ITERATIONS is reached.
-
-    This enables multi-step reasoning such as:
-        check availability → assign → verify no conflicts → reply
 
     Event types emitted:
         text_delta      — streamed assistant text token
         tool_call_start — a tool is about to execute (full args available)
         tool_result     — tool execution complete
-        done            — stream finished successfully
+        done            — stream finished successfully (includes session_id)
         error           — unrecoverable failure
     """
     api_key = os.environ.get("OPENAI_API_KEY", "")
@@ -111,8 +124,32 @@ async def run_agent_stream(request: AgentRequest, db: Session) -> AsyncGenerator
         return
 
     client = AsyncOpenAI(api_key=api_key)
-    messages: list[dict] = [{"role": "system", "content": build_system_prompt(db)}]
-    messages += [{"role": m.role, "content": m.content} for m in request.messages]
+
+    # ---- Session setup ----
+    session = None
+    if request.session_id:
+        session = get_session(db, request.session_id, user_id)
+        if session is None:
+            yield sse("error", {"message": f"Session {request.session_id} not found."})
+            return
+
+    # Build the initial messages list
+    if session:
+        # Load history from DB; only the last message from request is the new user message
+        new_user_msg = request.messages[-1]
+        loaded = load_session_messages(db, session)
+        messages: list[dict] = [
+            {"role": "system", "content": build_system_prompt(db, user_id, session.context_summary)}
+        ]
+        messages += loaded
+        messages.append({"role": new_user_msg.role, "content": new_user_msg.content})
+        # Persist the new user message immediately
+        save_message(db, session, "user", new_user_msg.content)
+        auto_title_session(db, session, new_user_msg.content)
+    else:
+        # Stateless fallback — original behavior
+        messages = [{"role": "system", "content": build_system_prompt(db)}]
+        messages += [{"role": m.role, "content": m.content} for m in request.messages]
 
     data_changed = False
 
@@ -170,12 +207,22 @@ async def run_agent_stream(request: AgentRequest, db: Session) -> AsyncGenerator
                     "content": assistant_text or None,
                     "tool_calls": tool_calls_for_history,
                 })
+                if session:
+                    save_message(db, session, "assistant", assistant_text or None,
+                                 metadata=tool_calls_for_history)
             else:
                 messages.append({"role": "assistant", "content": assistant_text})
+                if session:
+                    save_message(db, session, "assistant", assistant_text)
 
             # No tool calls → model is done; terminate the loop
             if not pending:
-                yield sse("done", {"data_changed": data_changed})
+                if session:
+                    await maybe_summarize(db, session, client, MODEL)
+                yield sse("done", {
+                    "data_changed": data_changed,
+                    "session_id": session.id if session else None,
+                })
                 return
 
             # ---- Execute all tool calls for this turn ----
@@ -193,7 +240,7 @@ async def run_agent_stream(request: AgentRequest, db: Session) -> AsyncGenerator
                     "args": args,
                 })
 
-                result = _dispatch_tool(tc["name"], args, db)
+                result = _dispatch_tool(tc["name"], args, db, user_id=user_id)
 
                 ok = not result.startswith("ERROR:")
                 if result.startswith("OK:") and tc["name"] not in READ_ONLY_TOOLS:
@@ -207,6 +254,9 @@ async def run_agent_stream(request: AgentRequest, db: Session) -> AsyncGenerator
                 })
 
                 messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                if session:
+                    save_message(db, session, "tool", result,
+                                 metadata={"tool_call_id": tc["id"], "name": tc["name"]})
 
             # Loop continues: model will see tool results and either call more tools or reply
 
