@@ -13,5 +13,8 @@ frontend/tsconfig.tsbuildinfo
 frontend/tsconfig.node.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
-.claude/
+# .claude — track shared config and plans, ignore local/ephemeral
+.claude/settings.local.json
+.claude/worktrees/
+.claude/memory/
 backend/.env
