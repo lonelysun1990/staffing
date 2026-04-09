@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel
+from sqlalchemy import text as sa_text
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
@@ -25,6 +27,7 @@ from .auth import (
     get_current_user,
     get_user_or_none,
     hash_password,
+    require_admin,
     require_auth,
     require_manager,
     verify_password,
@@ -514,3 +517,45 @@ async def import_schedule(file: UploadFile = File(...), db: Session = Depends(ge
         if "tmp_path" in locals() and tmp_path.exists():
             tmp_path.unlink()
     return result
+
+
+# ---------------------------------------------------------------------------
+# DB Console (admin only — read-only SQL queries)
+# ---------------------------------------------------------------------------
+
+class ConsoleQuery(BaseModel):
+    sql: str
+
+
+class ConsoleResult(BaseModel):
+    columns: List[str]
+    rows: List[List]
+    row_count: int
+
+
+@app.post("/console/query", response_model=ConsoleResult)
+def console_query(
+    body: ConsoleQuery,
+    db: Session = Depends(get_db),
+    _admin: UserORM = Depends(require_admin),
+) -> ConsoleResult:
+    """Execute a read-only SQL query and return column names + rows."""
+    sql = body.sql.strip()
+    if not sql:
+        raise HTTPException(status_code=400, detail="Empty query")
+
+    # Reject any statement that isn't a SELECT / SHOW / PRAGMA / EXPLAIN / WITH
+    first_word = sql.split()[0].upper()
+    if first_word not in ("SELECT", "SHOW", "PRAGMA", "EXPLAIN", "WITH", "\\dt", "\\d"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only read-only queries are allowed (SELECT, SHOW, PRAGMA, EXPLAIN, WITH)",
+        )
+
+    try:
+        result = db.execute(sa_text(sql))
+        columns = list(result.keys())
+        rows = [list(row) for row in result.fetchall()]
+        return ConsoleResult(columns=columns, rows=rows, row_count=len(rows))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))

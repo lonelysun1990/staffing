@@ -26,7 +26,8 @@ type TabKey =
   | "conflicts"
   | "auditLog"
   | "settings"
-  | "importExport";
+  | "importExport"
+  | "console";
 
 const TAB_LABELS: Record<TabKey, string> = {
   dataScientists: "Data Scientists",
@@ -37,6 +38,7 @@ const TAB_LABELS: Record<TabKey, string> = {
   auditLog: "Audit Log",
   settings: "Settings",
   importExport: "Import / Export",
+  console: "Console",
 };
 
 const startOfWeek = (input: Date) => {
@@ -225,6 +227,12 @@ function App() {
 
   const [importResult, setImportResult] = useState<ImportResult | null>(null);
   const [chatOpen, setChatOpen] = useState(false);
+
+  // Console state
+  const [consoleSql, setConsoleSql] = useState("SELECT * FROM data_scientists LIMIT 50;");
+  const [consoleResult, setConsoleResult] = useState<{ columns: string[]; rows: unknown[][]; row_count: number } | null>(null);
+  const [consoleError, setConsoleError] = useState<string | null>(null);
+  const [consoleLoading, setConsoleLoading] = useState(false);
 
   const weeks = useMemo(() => {
     const slots: string[] = [];
@@ -568,6 +576,22 @@ function App() {
     }
   };
 
+  const handleConsoleRun = async () => {
+    const sql = consoleSql.trim();
+    if (!sql) return;
+    setConsoleLoading(true);
+    setConsoleError(null);
+    setConsoleResult(null);
+    try {
+      const result = await api.consoleQuery(sql);
+      setConsoleResult(result);
+    } catch (err) {
+      setConsoleError(err instanceof Error ? err.message : "Query failed");
+    } finally {
+      setConsoleLoading(false);
+    }
+  };
+
   const handleConfigUpdate = async (updates: Partial<Config>) => {
     try {
       const updated = await api.updateConfig(updates);
@@ -800,7 +824,9 @@ function App() {
       </header>
 
       <nav className="tabs">
-        {Object.entries(TAB_LABELS).map(([key, label]) => (
+        {Object.entries(TAB_LABELS)
+          .filter(([key]) => key !== "console" || currentUser?.role === "admin")
+          .map(([key, label]) => (
           <button
             key={key}
             className={`tab ${tab === key ? "active" : ""}${key === "conflicts" && conflicts.length > 0 ? " tab--warn" : ""}`}
@@ -1868,6 +1894,90 @@ function App() {
                   <li>New projects: {importResult.created_projects}</li>
                   <li>Replaced: {importResult.replaced_existing_assignments}</li>
                 </ul>
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* ---------------------------------------------------------------- CONSOLE */}
+        {tab === "console" && (
+          <section className="panel">
+            <header className="panel__header">
+              <div>
+                <p className="eyebrow">Admin only</p>
+                <h2>DB Console</h2>
+              </div>
+            </header>
+
+            <div className="console-shortcuts">
+              {[
+                "SELECT * FROM data_scientists LIMIT 50;",
+                "SELECT * FROM projects LIMIT 50;",
+                "SELECT * FROM assignments LIMIT 50;",
+                "SELECT * FROM users;",
+                "SELECT * FROM audit_logs ORDER BY changed_at DESC LIMIT 50;",
+                "SELECT * FROM chat_sessions ORDER BY updated_at DESC LIMIT 20;",
+                "SELECT * FROM chat_messages ORDER BY id DESC LIMIT 50;",
+                "SELECT name FROM sqlite_master WHERE type='table';",
+              ].map((q) => (
+                <button
+                  key={q}
+                  className="ghost console-shortcut"
+                  onClick={() => setConsoleSql(q)}
+                >
+                  {q.replace(/SELECT \* FROM (\w+).*/i, "$1").replace(/SELECT (.*) FROM.*/i, "$1")}
+                </button>
+              ))}
+            </div>
+
+            <div className="console-editor">
+              <textarea
+                className="console-sql"
+                value={consoleSql}
+                onChange={(e) => setConsoleSql(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                    e.preventDefault();
+                    handleConsoleRun();
+                  }
+                }}
+                rows={5}
+                spellCheck={false}
+              />
+              <button className="primary" onClick={handleConsoleRun} disabled={consoleLoading}>
+                {consoleLoading ? "Running…" : "Run  ⌘↵"}
+              </button>
+            </div>
+
+            {consoleError && (
+              <div className="alert danger">{consoleError}</div>
+            )}
+
+            {consoleResult && (
+              <div className="console-result">
+                <p className="console-rowcount">{consoleResult.row_count} row{consoleResult.row_count !== 1 ? "s" : ""}</p>
+                <div className="table-wrapper">
+                  <table>
+                    <thead>
+                      <tr>
+                        {consoleResult.columns.map((col) => (
+                          <th key={col}>{col}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {consoleResult.rows.map((row, i) => (
+                        <tr key={i}>
+                          {row.map((cell, j) => (
+                            <td key={j} className="console-cell">
+                              {cell === null ? <span className="console-null">NULL</span> : String(cell)}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               </div>
             )}
           </section>

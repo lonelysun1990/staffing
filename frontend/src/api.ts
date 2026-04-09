@@ -193,6 +193,10 @@ export const api = {
   listMemories: (): Promise<MemoryItem[]> => request("/memories"),
   deleteMemory: (id: number): Promise<void> => request(`/memories/${id}`, { method: "DELETE" }),
 
+  // Console
+  consoleQuery: (sql: string): Promise<{ columns: string[]; rows: unknown[][]; row_count: number }> =>
+    request("/console/query", { method: "POST", body: JSON.stringify({ sql }) }),
+
   importSchedule: async (file: File): Promise<ImportResult> => {
     const formData = new FormData();
     formData.append("file", file);
