@@ -99,6 +99,12 @@ export interface AuditLogItem {
   details: Record<string, unknown> | null;
 }
 
+export interface User {
+  id: number;
+  username: string;
+  role: string;
+}
+
 export interface ChatSession {
   id: number;
   title: string | null;

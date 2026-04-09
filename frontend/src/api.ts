@@ -14,6 +14,7 @@ import {
   MemoryItem,
   Project,
   ProjectPayload,
+  User,
 } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
@@ -196,6 +197,15 @@ export const api = {
   // Console
   consoleQuery: (sql: string): Promise<{ columns: string[]; rows: unknown[][]; row_count: number }> =>
     request("/console/query", { method: "POST", body: JSON.stringify({ sql }) }),
+
+  // User management (admin only)
+  listUsers: (): Promise<User[]> => request("/users"),
+  adminCreateUser: (payload: { username: string; password: string; role: string }): Promise<User> =>
+    request("/users", { method: "POST", body: JSON.stringify(payload) }),
+  updateUser: (id: number, payload: { role?: string; password?: string }): Promise<User> =>
+    request(`/users/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
+  deleteUser: (id: number): Promise<void> =>
+    request(`/users/${id}`, { method: "DELETE" }),
 
   importSchedule: async (file: File): Promise<ImportResult> => {
     const formData = new FormData();

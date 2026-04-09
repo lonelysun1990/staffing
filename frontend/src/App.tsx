@@ -15,6 +15,7 @@ import {
   ImportResult,
   Project,
   ProjectPayload,
+  User,
 } from "./types";
 import "./App.css";
 
@@ -227,6 +228,12 @@ function App() {
 
   const [importResult, setImportResult] = useState<ImportResult | null>(null);
   const [chatOpen, setChatOpen] = useState(false);
+
+  // User management state (admin only)
+  const [users, setUsers] = useState<User[]>([]);
+  const [userFormOpen, setUserFormOpen] = useState(false);
+  const [newUserForm, setNewUserForm] = useState({ username: "", password: "", role: "manager" });
+  const [userMgmtError, setUserMgmtError] = useState<string | null>(null);
 
   // Console state
   const [consoleSql, setConsoleSql] = useState("SELECT * FROM data_scientists LIMIT 50;");
@@ -576,6 +583,48 @@ function App() {
     }
   };
 
+  const loadUsers = async () => {
+    if (currentUser?.role !== "admin") return;
+    try {
+      setUsers(await api.listUsers());
+    } catch { /* non-admin gets 403, silently ignored */ }
+  };
+
+  const handleUpdateUserRole = async (userId: number, role: string) => {
+    try {
+      const updated = await api.updateUser(userId, { role });
+      setUsers((prev) => prev.map((u) => (u.id === updated.id ? updated : u)));
+    } catch (err) {
+      setUserMgmtError(err instanceof Error ? err.message : "Failed to update role");
+    }
+  };
+
+  const handleDeleteUser = async (userId: number) => {
+    try {
+      await api.deleteUser(userId);
+      setUsers((prev) => prev.filter((u) => u.id !== userId));
+    } catch (err) {
+      setUserMgmtError(err instanceof Error ? err.message : "Failed to delete user");
+    }
+  };
+
+  const handleAdminCreateUser = async () => {
+    setUserMgmtError(null);
+    if (!newUserForm.username.trim() || !newUserForm.password.trim()) {
+      setUserMgmtError("Username and password are required");
+      return;
+    }
+    try {
+      const created = await api.adminCreateUser(newUserForm);
+      setUsers((prev) => [...prev, created]);
+      setNewUserForm({ username: "", password: "", role: "manager" });
+      setUserFormOpen(false);
+      setStatus(`User '${created.username}' created`);
+    } catch (err) {
+      setUserMgmtError(err instanceof Error ? err.message : "Failed to create user");
+    }
+  };
+
   const handleConsoleRun = async () => {
     const sql = consoleSql.trim();
     if (!sql) return;
@@ -834,6 +883,7 @@ function App() {
               resetMessages();
               setTab(key as TabKey);
               if (key === "auditLog") handleLoadAuditLogs();
+              if (key === "settings") loadUsers();
             }}
           >
             {label}
@@ -1838,6 +1888,106 @@ function App() {
                   onChange={(e) => handleConfigUpdate({ horizon_weeks: Number(e.target.value) || 1 })} />
               </label>
             </div>
+
+            {currentUser?.role === "admin" && (
+              <div className="card" style={{ marginTop: "2rem" }}>
+                <div className="panel__header" style={{ marginBottom: "1rem" }}>
+                  <div>
+                    <p className="eyebrow">Admin only</p>
+                    <h3>User Management</h3>
+                  </div>
+                  <button className="secondary" onClick={() => { setUserFormOpen(true); setUserMgmtError(null); }}>
+                    + Add user
+                  </button>
+                </div>
+
+                {userMgmtError && <div className="alert danger" style={{ marginBottom: "12px" }}>{userMgmtError}</div>}
+
+                {userFormOpen && (
+                  <div className="form-grid" style={{ marginBottom: "16px", padding: "14px", background: "#f8fafc", border: "1px solid #e5e7eb", borderRadius: "8px" }}>
+                    <label>
+                      Username
+                      <input
+                        type="text"
+                        value={newUserForm.username}
+                        onChange={(e) => setNewUserForm((f) => ({ ...f, username: e.target.value }))}
+                      />
+                    </label>
+                    <label>
+                      Password
+                      <input
+                        type="password"
+                        value={newUserForm.password}
+                        onChange={(e) => setNewUserForm((f) => ({ ...f, password: e.target.value }))}
+                      />
+                    </label>
+                    <label>
+                      Role
+                      <select
+                        value={newUserForm.role}
+                        onChange={(e) => setNewUserForm((f) => ({ ...f, role: e.target.value }))}
+                      >
+                        <option value="viewer">Viewer</option>
+                        <option value="manager">Manager</option>
+                        <option value="admin">Admin</option>
+                      </select>
+                    </label>
+                    <div className="actions" style={{ alignSelf: "flex-end", paddingBottom: "2px" }}>
+                      <button className="primary" onClick={handleAdminCreateUser}>Create</button>
+                      <button className="ghost" onClick={() => { setUserFormOpen(false); setUserMgmtError(null); }}>Cancel</button>
+                    </div>
+                  </div>
+                )}
+
+                <div className="table-wrapper">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Username</th>
+                        <th>Role</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {users.map((u) => (
+                        <tr key={u.id}>
+                          <td>
+                            {u.username}
+                            {u.username === currentUser?.username && (
+                              <span className="tag small" style={{ marginLeft: 8 }}>you</span>
+                            )}
+                          </td>
+                          <td>
+                            <select
+                              value={u.role}
+                              disabled={u.username === currentUser?.username}
+                              onChange={(e) => { setUserMgmtError(null); handleUpdateUserRole(u.id, e.target.value); }}
+                              style={{ fontSize: 13 }}
+                            >
+                              <option value="viewer">Viewer</option>
+                              <option value="manager">Manager</option>
+                              <option value="admin">Admin</option>
+                            </select>
+                          </td>
+                          <td className="actions">
+                            <button
+                              className="ghost danger"
+                              disabled={u.username === currentUser?.username}
+                              onClick={() => { setUserMgmtError(null); handleDeleteUser(u.id); }}
+                            >
+                              Delete
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                      {users.length === 0 && (
+                        <tr><td colSpan={3} className="muted">No users found.</td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
           </section>
         )}
 
