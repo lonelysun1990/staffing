@@ -112,10 +112,19 @@ export function ChatPanel({ isOpen, onClose, onDataChanged }: ChatPanelProps) {
     }
   };
 
-  const handleNewSession = () => {
-    setActiveSessionId(null);
-    setItems([GREETING]);
-    setInput("");
+  const handleNewSession = async () => {
+    try {
+      const newSession = await api.createSession();
+      setSessions((prev) => [newSession, ...prev]);
+      setActiveSessionId(newSession.id);
+      setItems([GREETING]);
+      setInput("");
+    } catch {
+      // Fallback to stateless mode if session creation fails
+      setActiveSessionId(null);
+      setItems([GREETING]);
+      setInput("");
+    }
   };
 
   const handleSwitchSession = async (id: number) => {

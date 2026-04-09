@@ -182,6 +182,7 @@ export const api = {
 
   // Sessions
   listSessions: (): Promise<ChatSession[]> => request("/sessions"),
+  createSession: (): Promise<ChatSession> => request("/sessions", { method: "POST" }),
   deleteSession: (id: number): Promise<void> => request(`/sessions/${id}`, { method: "DELETE" }),
   renameSession: (id: number, title: string): Promise<ChatSession> =>
     request(`/sessions/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }),
