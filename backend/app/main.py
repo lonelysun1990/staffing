@@ -52,7 +52,7 @@ from .models import (
     SessionPatch,
 )
 from .orm_models import AgentMemoryORM, ChatSessionORM, ChatMessageORM
-from .agent import AgentRequest, AgentResponse, run_agent, run_agent_stream
+from .agent import AgentRequest, run_agent_stream
 from .agent.chat_storage import create_session, get_session
 from .seed_db import seed
 
@@ -322,11 +322,6 @@ async def import_json(file: UploadFile = File(...), db: Session = Depends(get_db
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}")
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.post("/agent/chat", response_model=AgentResponse)
-def agent_chat(request: AgentRequest, db: Session = Depends(get_db)) -> AgentResponse:
-    return run_agent(request, db)
 
 
 @app.post("/agent/chat/stream")

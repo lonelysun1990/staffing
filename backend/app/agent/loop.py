@@ -1,8 +1,5 @@
 """
-Agent loop implementations.
-
-run_agent       — synchronous, single-round (legacy, kept for backward compat)
-run_agent_stream — async generator, proper multi-turn agentic loop with SSE streaming
+Agent loop — async streaming implementation.
 """
 
 from __future__ import annotations
@@ -15,7 +12,6 @@ from sqlalchemy.orm import Session
 
 from .chat_storage import (
     auto_title_session,
-    create_session,
     get_session,
     load_session_messages,
     maybe_summarize,
@@ -23,72 +19,13 @@ from .chat_storage import (
 )
 from .context import build_system_prompt
 from .executor import _dispatch_tool
-from .models import AgentRequest, AgentResponse
+from .models import AgentRequest
 from .sse import sse
 from .tools import READ_ONLY_TOOLS, TOOLS
 
 MODEL = "gpt-4o"
 MAX_ITERATIONS = 8
 
-
-# ---------------------------------------------------------------------------
-# Synchronous loop (legacy — preserves existing /agent/chat behavior)
-# ---------------------------------------------------------------------------
-
-def run_agent(request: AgentRequest, db: Session) -> AgentResponse:
-    """Single-round synchronous agent. Kept for backward compatibility."""
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
-        return AgentResponse(
-            reply="OpenAI API key is not configured. Please add OPENAI_API_KEY to backend/.env.",
-            data_changed=False,
-        )
-
-    try:
-        from openai import OpenAI
-    except ImportError:
-        return AgentResponse(
-            reply="openai package is not installed. Run: pip install openai",
-            data_changed=False,
-        )
-
-    client = OpenAI(api_key=api_key)
-    messages: list[dict] = [{"role": "system", "content": build_system_prompt(db)}]
-    messages += [{"role": m.role, "content": m.content} for m in request.messages]
-
-    data_changed = False
-    response = client.chat.completions.create(model=MODEL, tools=TOOLS, messages=messages)
-    msg = response.choices[0].message
-
-    if not msg.tool_calls:
-        return AgentResponse(reply=msg.content or "", data_changed=False)
-
-    messages.append(msg.model_dump(exclude_none=True))
-    tool_results = []
-    clarification_reply: Optional[str] = None
-
-    for tc in msg.tool_calls:
-        args = json.loads(tc.function.arguments)
-        result = _dispatch_tool(tc.function.name, args, db)
-
-        if result.startswith("CLARIFICATION_NEEDED:"):
-            clarification_reply = result[len("CLARIFICATION_NEEDED:"):].strip()
-        elif result.startswith("OK:") and tc.function.name not in READ_ONLY_TOOLS:
-            data_changed = True
-
-        tool_results.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-
-    if clarification_reply:
-        return AgentResponse(reply=clarification_reply, data_changed=data_changed)
-
-    messages += tool_results
-    follow_up = client.chat.completions.create(model=MODEL, messages=messages)
-    return AgentResponse(reply=follow_up.choices[0].message.content or "Done.", data_changed=data_changed)
-
-
-# ---------------------------------------------------------------------------
-# Async streaming loop (new — /agent/chat/stream)
-# ---------------------------------------------------------------------------
 
 async def run_agent_stream(
     request: AgentRequest,

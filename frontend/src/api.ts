@@ -51,11 +51,6 @@ export interface ChatMessage {
   content: string;
 }
 
-export interface AgentResponse {
-  reply: string;
-  data_changed: boolean;
-}
-
 export type AgentStreamEvent =
   | { type: "text_delta"; delta: string }
   | { type: "tool_call_start"; tool_call_id: string; name: string; args: Record<string, unknown> }
@@ -155,12 +150,6 @@ export const api = {
     if (!response.ok) throw new Error(await response.text() || "Failed to import JSON");
     return response.json() as Promise<ImportResult>;
   },
-
-  sendAgentMessage: (messages: ChatMessage[]): Promise<AgentResponse> =>
-    request("/agent/chat", {
-      method: "POST",
-      body: JSON.stringify({ messages }),
-    }),
 
   async *streamAgentMessage(messages: ChatMessage[], sessionId?: number): AsyncGenerator<AgentStreamEvent> {
     const response = await fetch(`${API_BASE}/agent/chat/stream`, {
