@@ -378,6 +378,58 @@ TOOLS: list[dict] = [
             },
         },
     },
+    # ------------------------------------------------------------------ #
+    # Dynamic tool management
+    # ------------------------------------------------------------------ #
+    {
+        "type": "function",
+        "function": {
+            "name": "create_dynamic_tool",
+            "description": (
+                "Create a reusable Python tool stored in the database with its own isolated environment. "
+                "Specify required packages and they will be installed in the background. "
+                "Check env_status with list_dynamic_tools before running a tool with packages."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "snake_case name, e.g. 'calculate_fte_gap'"},
+                    "description": {"type": "string", "description": "What the tool does"},
+                    "parameters_schema": {"type": "object", "description": "JSON Schema for the function's parameters"},
+                    "code": {"type": "string", "description": "Python code. Must define a function with the same name as the tool."},
+                    "requirements": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Packages to install, e.g. ['pandas==2.2.3']. Empty list if none needed.",
+                    },
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags"},
+                },
+                "required": ["name", "description", "parameters_schema", "code", "requirements"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_dynamic_tools",
+            "description": "List all dynamic tools, their env_status (pending/ready/failed), and usage count.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_dynamic_tool",
+            "description": "Delete a dynamic tool and its virtual environment.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Tool name to delete"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
 ]
 
 # Tools that do not modify data — used by the loop to decide whether to set data_changed=True.
@@ -386,4 +438,5 @@ READ_ONLY_TOOLS: frozenset[str] = frozenset({
     "check_conflicts",
     "suggest_data_scientists",
     "list_memories",
+    "list_dynamic_tools",
 })

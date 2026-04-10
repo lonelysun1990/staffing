@@ -14,8 +14,11 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
+import json as _json
+
 from .. import storage
 from ..orm_models import AgentMemoryORM
+from .dynamic_tools import list_dynamic_tools as _list_dyn_tools
 
 
 def _memory_section(db: Session, user_id: Optional[int]) -> str:
@@ -32,6 +35,18 @@ def _memory_section(db: Session, user_id: Optional[int]) -> str:
         for m in memories
     ]
     return "\n## Your long-term memory about this user\n" + "\n".join(lines) + "\n"
+
+
+def _dynamic_tools_section(db: Session) -> str:
+    tools = [t for t in _list_dyn_tools(db) if t.env_status == "ready"]
+    if not tools:
+        return ""
+    lines = ["\n## Available custom dynamic tools (call by name)"]
+    for t in tools:
+        params = _json.loads(t.parameters_schema).get("properties", {})
+        param_str = ", ".join(params.keys()) if params else "no parameters"
+        lines.append(f"  - {t.name}({param_str}): {t.description}")
+    return "\n".join(lines) + "\n"
 
 
 def _summary_section(context_summary: Optional[str]) -> str:
@@ -114,4 +129,4 @@ Rules:
 
 ## Current assignments (summary)
 {assign_summary}
-{_memory_section(db, user_id)}{_summary_section(context_summary)}"""
+{_memory_section(db, user_id)}{_summary_section(context_summary)}{_dynamic_tools_section(db)}"""

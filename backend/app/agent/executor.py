@@ -26,8 +26,14 @@ from ..models import (
     ProjectCreate,
     ProjectWeek,
 )
-from ..orm_models import AgentMemoryORM
+from ..orm_models import AgentMemoryORM, DynamicToolORM
 from .tools import READ_ONLY_TOOLS  # re-exported for loop.py convenience
+from .dynamic_tools import (
+    RESERVED_NAMES, validate_tool_code,
+    create_dynamic_tool, get_dynamic_tool_by_name,
+    list_dynamic_tools, delete_dynamic_tool, increment_usage,
+)
+from .sandbox import execute_in_sandbox
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +487,56 @@ def _execute_list_memories(
 
 # ---------------------------------------------------------------------------
 
+def _execute_create_dynamic_tool(db: Session, args: dict) -> str:
+    name = args["name"]
+    if name in RESERVED_NAMES:
+        return f"ERROR: '{name}' is a reserved tool name and cannot be used"
+    if get_dynamic_tool_by_name(db, name):
+        return f"ERROR: Tool '{name}' already exists. Delete it first to recreate."
+    err = validate_tool_code(args["code"], name)
+    if err:
+        return f"ERROR: {err}"
+    _, msg = create_dynamic_tool(
+        db, name=name, description=args["description"],
+        parameters_schema=args["parameters_schema"],
+        code=args["code"], requirements=args.get("requirements", []),
+        tags=args.get("tags"),
+    )
+    return f"OK: {msg}"
+
+
+def _execute_list_dynamic_tools(db: Session) -> str:
+    import json as _json
+    tools = list_dynamic_tools(db)
+    if not tools:
+        return "OK: No dynamic tools created yet."
+    lines = ["OK: Dynamic tools:"]
+    for t in tools:
+        reqs = _json.loads(t.requirements) if t.requirements else []
+        req_str = f" [{', '.join(reqs)}]" if reqs else ""
+        lines.append(f"  - {t.name}: {t.description}")
+        lines.append(f"    status={t.env_status}{req_str}, used={t.usage_count}x")
+        if t.env_status == "failed" and t.env_error:
+            lines.append(f"    error: {t.env_error}")
+    return "\n".join(lines)
+
+
+def _execute_delete_dynamic_tool(db: Session, args: dict) -> str:
+    name = args["name"]
+    return f"OK: Deleted tool '{name}'" if delete_dynamic_tool(db, name) \
+        else f"ERROR: Tool '{name}' not found"
+
+
+def _execute_run_dynamic_tool(db: Session, tool: DynamicToolORM, args: dict) -> str:
+    if tool.env_status == "pending":
+        return f"ERROR: Tool '{tool.name}' is still installing packages. Try again shortly."
+    if tool.env_status == "failed":
+        return f"ERROR: Tool '{tool.name}' environment setup failed: {tool.env_error}"
+    result = execute_in_sandbox(tool.name, tool.code, tool.name, args)
+    increment_usage(db, tool.id)
+    return f"OK: {result['result']}" if result["ok"] else f"ERROR: {result['error']}"
+
+
 def _dispatch_tool(fn_name: str, args: dict, db: Session, user_id: Optional[int] = None) -> str:
     """Route a tool call to the appropriate execute function."""
     match fn_name:
@@ -532,5 +588,14 @@ def _dispatch_tool(fn_name: str, args: dict, db: Session, user_id: Optional[int]
             )
         case "list_memories":
             return _execute_list_memories(db, user_id, args.get("category"))
+        case "create_dynamic_tool":
+            return _execute_create_dynamic_tool(db, args)
+        case "list_dynamic_tools":
+            return _execute_list_dynamic_tools(db)
+        case "delete_dynamic_tool":
+            return _execute_delete_dynamic_tool(db, args)
         case _:
+            tool = get_dynamic_tool_by_name(db, fn_name)
+            if tool:
+                return _execute_run_dynamic_tool(db, tool, args)
             return f"ERROR: Unknown tool '{fn_name}'"

@@ -168,3 +168,22 @@ class AgentMemoryORM(Base):
     updated_at        = Column(String, nullable=False)
 
     __table_args__ = (UniqueConstraint("user_id", "key"),)
+
+
+class DynamicToolORM(Base):
+    __tablename__ = "dynamic_tools"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), unique=True, nullable=False, index=True)
+    description = Column(Text, nullable=False)
+    parameters_schema = Column(Text, nullable=False)  # JSON string of JSON Schema
+    code = Column(Text, nullable=False)
+    requirements = Column(Text, nullable=False, default="[]")  # JSON array: ["pandas==2.2.3"]
+    env_status = Column(String(20), nullable=False, default="pending")  # pending | ready | failed
+    env_error = Column(Text, nullable=True)
+
+    created_at = Column(String, nullable=False)
+    updated_at = Column(String, nullable=False)
+    usage_count = Column(Integer, default=0)
+    last_used_at = Column(String, nullable=True)
+    tags = Column(Text, nullable=True)  # JSON array string
