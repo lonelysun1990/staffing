@@ -2,78 +2,52 @@
 
 ## Overview
 
-Add the ability for the agent to dynamically generate Python tools that run in isolated subprocess environments. **Each tool has its own dedicated Python virtual environment** with its specific dependencies stored in the database. Tools are stored in PostgreSQL for reuse and can optionally be promoted to the codebase.
+Allow the agent to create, store, and execute custom Python tools at runtime. Each tool gets its own isolated virtual environment with its declared dependencies. Tools are stored in PostgreSQL and survive across sessions. The agent can call them by name just like static tools.
 
 ## Architecture
 
-```mermaid
-flowchart TB
-    subgraph AgentLoop [Agent Loop]
-        dispatch[_dispatch_tool]
-    end
-    
-    subgraph StaticTools [Static Tools]
-        set_assignment
-        get_availability
-        other_tools[...]
-    end
-    
-    subgraph DynamicSystem [Dynamic Tool System]
-        create_tool[create_dynamic_tool]
-        run_tool[Dynamic Tool Executor]
-        db[(PostgreSQL dynamic_tools)]
-    end
-    
-    subgraph SandboxManager [Sandbox Environment Manager]
-        env_manager[Environment Manager]
-        venv_tool_a[/venv: tool_a/]
-        venv_tool_b[/venv: tool_b/]
-        venv_tool_n[/venv: tool_n/]
-    end
-    
-    dispatch --> StaticTools
-    dispatch --> create_tool
-    dispatch -->|unknown tool| run_tool
-    create_tool --> db
-    create_tool --> env_manager
-    env_manager -->|create venv + pip install| venv_tool_a
-    env_manager -->|create venv + pip install| venv_tool_b
-    run_tool --> db
-    run_tool -->|lookup tool's venv| env_manager
-    env_manager --> venv_tool_a
-    env_manager --> venv_tool_b
-    env_manager --> venv_tool_n
-```
+- **Per-tool venvs** at `/sandbox-envs/<tool_name>/` — created dynamically at runtime, not at build time
+- **No Docker required** — nixpacks build continues unchanged; venvs are created by the running app
+- **Subprocess execution** — tool code runs in a child process using the tool's venv Python; no env vars leaked
+- **Railway Volume** — mount a persistent volume at `/sandbox-envs/` so venvs survive redeploys
 
-## Key Concept: Per-Tool Environments
+---
 
-Each dynamic tool gets its **own isolated Python virtual environment**:
+## Files to Change
 
-- When a tool is created, its required packages (e.g., `["pandas==2.2.3", "scipy>=1.11.0"]`) are stored in the database
-- A dedicated venv is created at `/sandbox-envs/<tool_name>/` with those exact dependencies
-- When the tool runs, it uses its specific venv's Python interpreter
-- This allows different tools to have different (even conflicting) package versions
+| File | Change |
+|------|--------|
+| `backend/app/orm_models.py` | Add `DynamicToolORM` |
+| `backend/app/agent/env_manager.py` | **New** — venv create/delete/check helpers |
+| `backend/app/agent/sandbox.py` | **New** — subprocess executor |
+| `backend/app/agent/dynamic_tools.py` | **New** — DB CRUD |
+| `backend/app/agent/tools.py` | Add 3 new tool schemas; update `READ_ONLY_TOOLS` |
+| `backend/app/agent/executor.py` | Add handlers; update `_dispatch_tool` fallback |
+| `backend/app/agent/context.py` | Inject available dynamic tools into system prompt |
+| `backend/app/main.py` | Add startup venv recovery; add REST endpoints for tool management |
 
-```
-/sandbox-envs/
-├── calculate_fte_gap/
-│   ├── bin/python
-│   └── lib/python3.11/site-packages/  (pandas, numpy)
-├── forecast_demand/
-│   ├── bin/python
-│   └── lib/python3.11/site-packages/  (pandas, scikit-learn, prophet)
-└── parse_excel_report/
-    ├── bin/python
-    └── lib/python3.11/site-packages/  (pandas, openpyxl)
-```
+---
 
-## File Changes
+## Fix Index (applied throughout this plan)
 
-### 1. Database: New ORM Model and Migration
+| # | Issue | Fix |
+|---|-------|-----|
+| 1 | pip install blocks async event loop | Background `threading.Thread`; tool created in DB instantly with `env_status="pending"` |
+| 2 | Railway ephemeral filesystem destroys venvs on redeploy | Railway Volume mounted at `/sandbox-envs/`; startup recovery recreates any missing ones |
+| 3 | `session_id` not in `_dispatch_tool` call site | Remove `created_by_session_id` FK from ORM entirely |
+| 4 | `env={}` breaks package imports (no PATH/HOME) | Use `{"PATH": "/usr/bin:/bin", "HOME": "/tmp"}` |
+| 5 | `resource.setrlimit` silently fails in containers | Remove entirely; subprocess `timeout=30` is the real guard |
+| 6 | `python_version` field stored but never used | Remove from ORM |
+| 7 | `context.py` injection shown as handwavy `lines.append` | Exact injection shown matching actual `build_system_prompt` string construction |
+| 8 | Dynamic tool name can shadow static tool names | `RESERVED_NAMES` frozenset checked before creation |
+| 9 | `ensure_tool_environments` uses `db` as free variable | Use `with SessionLocal() as db:` inside the function |
+| 10 | `os.unlink(script_path)` skipped on timeout | Move to `finally` block |
 
-**File: [backend/app/orm_models.py](backend/app/orm_models.py)**
+---
 
-Add `DynamicToolORM` model after `AgentMemoryORM`:
+## Step 1 — ORM Model (`orm_models.py`)
+
+Add after `AgentMemoryORM`. **Removed vs. original**: `python_version` (fix 6), `created_by_session_id` (fix 3), `is_verified`.
 
 ```python
 class DynamicToolORM(Base):
@@ -82,135 +56,95 @@ class DynamicToolORM(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(100), unique=True, nullable=False, index=True)
     description = Column(Text, nullable=False)
-    parameters_schema = Column(Text, nullable=False)  # JSON string
+    parameters_schema = Column(Text, nullable=False)  # JSON string of JSON Schema
     code = Column(Text, nullable=False)
-    
-    # Runtime environment specification
-    python_version = Column(String(20), nullable=False, default="3.11")
-    requirements = Column(Text, nullable=False)  # JSON array: ["pandas==2.2.3", "numpy>=1.26.0"]
-    env_status = Column(String(20), nullable=False, default="pending")  # pending, ready, failed
-    env_error = Column(Text, nullable=True)  # Error message if env creation failed
-    
+    requirements = Column(Text, nullable=False, default="[]")  # JSON array: ["pandas==2.2.3"]
+    env_status = Column(String(20), nullable=False, default="pending")  # pending | ready | failed
+    env_error = Column(Text, nullable=True)
+
     created_at = Column(String, nullable=False)
     updated_at = Column(String, nullable=False)
-    created_by_session_id = Column(Integer, ForeignKey("chat_sessions.id"), nullable=True)
-    
     usage_count = Column(Integer, default=0)
     last_used_at = Column(String, nullable=True)
-    is_verified = Column(Integer, default=0)  # 0=false, 1=true
     tags = Column(Text, nullable=True)  # JSON array string
 ```
 
-**Key additions:**
-- `python_version`: Python version for this tool's environment
-- `requirements`: JSON array of pip requirements (e.g., `["pandas==2.2.3", "scipy>=1.11.0"]`)
-- `env_status`: Track whether the venv is ready (`pending`, `ready`, `failed`)
-- `env_error`: Store error message if environment creation fails
+Auto-created by the existing `Base.metadata.create_all()` in lifespan — no migration script needed.
 
-**Migration**: Create SQL migration script or use raw SQL to add the table.
+---
 
-### 2. Environment Manager Module
-
-**New file: [backend/app/agent/env_manager.py](backend/app/agent/env_manager.py)**
-
-Manages per-tool virtual environments:
+## Step 2 — Environment Manager (`agent/env_manager.py`) — New File
 
 ```python
-import subprocess
 import os
-import json
 import shutil
+import subprocess
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 SANDBOX_ENVS_DIR = Path(os.environ.get("SANDBOX_ENVS_DIR", "/sandbox-envs"))
 
-def get_tool_venv_path(tool_name: str) -> Path:
-    """Get the venv path for a specific tool."""
-    return SANDBOX_ENVS_DIR / tool_name
 
 def get_tool_python(tool_name: str) -> str:
-    """Get the Python interpreter path for a tool's venv."""
-    return str(get_tool_venv_path(tool_name) / "bin" / "python")
+    return str(SANDBOX_ENVS_DIR / tool_name / "bin" / "python")
+
+
+def environment_exists(tool_name: str) -> bool:
+    return Path(get_tool_python(tool_name)).exists()
+
 
 def create_tool_environment(tool_name: str, requirements: List[str]) -> dict:
-    """
-    Create a new virtual environment for a tool and install its dependencies.
-    Returns {"ok": True} or {"ok": False, "error": "..."}
-    """
-    venv_path = get_tool_venv_path(tool_name)
-    
+    """Create venv and install dependencies. Blocking — call from a background thread."""
+    venv_path = SANDBOX_ENVS_DIR / tool_name
     try:
-        # Create venv
         subprocess.run(
             ["python", "-m", "venv", str(venv_path)],
-            check=True,
-            capture_output=True,
-            timeout=60,
+            check=True, capture_output=True, timeout=60,
         )
-        
-        # Install requirements
         if requirements:
-            pip_path = venv_path / "bin" / "pip"
+            pip = venv_path / "bin" / "pip"
             subprocess.run(
-                [str(pip_path), "install", "--no-cache-dir"] + requirements,
-                check=True,
-                capture_output=True,
-                timeout=300,  # 5 min timeout for pip install
+                [str(pip), "install", "--no-cache-dir"] + requirements,
+                check=True, capture_output=True, timeout=300,
             )
-        
         return {"ok": True}
     except subprocess.CalledProcessError as e:
         return {"ok": False, "error": e.stderr.decode() if e.stderr else str(e)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+
 def delete_tool_environment(tool_name: str) -> None:
-    """Remove a tool's virtual environment."""
-    venv_path = get_tool_venv_path(tool_name)
+    venv_path = SANDBOX_ENVS_DIR / tool_name
     if venv_path.exists():
         shutil.rmtree(venv_path)
-
-def environment_exists(tool_name: str) -> bool:
-    """Check if a tool's environment exists and has a Python interpreter."""
-    python_path = Path(get_tool_python(tool_name))
-    return python_path.exists()
 ```
 
-### 3. Sandbox Executor Module
+---
 
-**New file: [backend/app/agent/sandbox.py](backend/app/agent/sandbox.py)**
+## Step 3 — Sandbox Executor (`agent/sandbox.py`) — New File
+
+Key fixes applied: `env={"PATH":..., "HOME":...}` not `env={}` (fix 4), `os.unlink` in `finally` (fix 10), no `resource.setrlimit` (fix 5).
 
 ```python
-import subprocess
-import tempfile
 import json
 import os
-from typing import Any
+import subprocess
+import tempfile
 from .env_manager import get_tool_python, environment_exists
 
 TIMEOUT_SECONDS = 30
 
+
 def execute_in_sandbox(tool_name: str, code: str, function_name: str, args: dict) -> dict:
-    """
-    Execute dynamic tool code in the tool's isolated virtual environment.
-    
-    Each tool has its own venv with its specific dependencies.
+    """Execute tool code in its isolated venv subprocess.
+    Returns {"ok": True, "result": ...} or {"ok": False, "error": "..."}
     """
     if not environment_exists(tool_name):
-        return {"ok": False, "error": f"Environment for tool '{tool_name}' not ready"}
-    
-    python_path = get_tool_python(tool_name)
-    
-    runner_code = f'''
-import json
-import sys
-import resource
+        return {"ok": False, "error": f"Environment for '{tool_name}' not ready yet"}
 
-# Resource limits
-resource.setrlimit(resource.RLIMIT_CPU, (10, 10))
-resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, 256 * 1024 * 1024))
-
+    runner = f"""
+import json, sys
 {code}
 
 if __name__ == "__main__":
@@ -220,46 +154,86 @@ if __name__ == "__main__":
         print(json.dumps({{"ok": True, "result": result}}, default=str))
     except Exception as e:
         print(json.dumps({{"ok": False, "error": str(e)}}))
-'''
-    
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write(runner_code)
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write(runner)
         script_path = f.name
-    
+
     try:
-        result = subprocess.run(
-            [python_path, script_path, json.dumps(args)],
+        proc = subprocess.run(
+            [get_tool_python(tool_name), script_path, json.dumps(args)],
             capture_output=True,
             text=True,
             timeout=TIMEOUT_SECONDS,
-            env={},  # Empty env - no access to main app's env vars
+            env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"},  # fix 4: no app secrets, minimal env
         )
-        
-        os.unlink(script_path)
-        
-        if result.returncode == 0:
-            return json.loads(result.stdout)
-        return {"ok": False, "error": result.stderr or "Unknown error"}
+        if proc.returncode == 0 and proc.stdout.strip():
+            return json.loads(proc.stdout.strip())
+        return {"ok": False, "error": proc.stderr.strip() or "No output"}
     except subprocess.TimeoutExpired:
-        os.unlink(script_path)
-        return {"ok": False, "error": "Execution timed out"}
+        return {"ok": False, "error": f"Timed out after {TIMEOUT_SECONDS}s"}
     except json.JSONDecodeError:
-        return {"ok": False, "error": f"Invalid output: {result.stdout}"}
+        return {"ok": False, "error": f"Unparseable output: {proc.stdout[:300]}"}
+    finally:
+        os.unlink(script_path)  # fix 10: always cleans up even on timeout
 ```
 
-### 4. Dynamic Tool Storage Functions
+---
 
-**New file: [backend/app/agent/dynamic_tools.py](backend/app/agent/dynamic_tools.py)**
+## Step 4 — Dynamic Tool CRUD (`agent/dynamic_tools.py`) — New File
 
-CRUD operations for dynamic tools:
+Fix 8 (reserved names), fix 3 (no session_id), max code size guard included.
 
 ```python
-from datetime import datetime
-from typing import List, Optional
+import ast
+import json
+import threading
+from datetime import datetime, timezone
+from typing import Optional
 from sqlalchemy.orm import Session
 from ..orm_models import DynamicToolORM
-from .env_manager import create_tool_environment, delete_tool_environment
-import json
+from ..database import SessionLocal
+from .env_manager import create_tool_environment, delete_tool_environment, environment_exists
+
+# Fix 8: names that dynamic tools cannot shadow
+RESERVED_NAMES = frozenset({
+    "set_assignment", "clear_assignment", "get_availability", "check_conflicts",
+    "suggest_data_scientists", "update_data_scientist", "update_project",
+    "create_data_scientist", "create_project", "remember_fact", "list_memories",
+    "create_dynamic_tool", "list_dynamic_tools", "delete_dynamic_tool",
+})
+
+MAX_CODE_BYTES = 10_000
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def validate_tool_code(code: str, function_name: str) -> Optional[str]:
+    """Returns error string or None if valid."""
+    if len(code.encode()) > MAX_CODE_BYTES:
+        return f"Code exceeds {MAX_CODE_BYTES} byte limit"
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return f"Syntax error: {e}"
+    names = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+    if function_name not in names:
+        return f"Code must define a function named '{function_name}'"
+    return None
+
+
+def _setup_env_background(tool_id: int, tool_name: str, requirements: list) -> None:
+    """Fix 1: runs in a background thread so pip install never blocks the event loop."""
+    with SessionLocal() as db:  # fix 9: own session, not a free variable
+        result = create_tool_environment(tool_name, requirements)
+        tool = db.query(DynamicToolORM).filter(DynamicToolORM.id == tool_id).first()
+        if tool:
+            tool.env_status = "ready" if result["ok"] else "failed"
+            tool.env_error = result.get("error") if not result["ok"] else None
+            db.commit()
+
 
 def create_dynamic_tool(
     db: Session,
@@ -267,117 +241,129 @@ def create_dynamic_tool(
     description: str,
     parameters_schema: dict,
     code: str,
-    requirements: List[str],
-    session_id: Optional[int] = None,
-    tags: Optional[List[str]] = None,
-) -> DynamicToolORM:
-    """Create a new dynamic tool and set up its environment."""
-    now = datetime.utcnow().isoformat()
-    
+    requirements: list,
+    tags: Optional[list] = None,
+) -> tuple[DynamicToolORM, str]:
+    """
+    Inserts the tool row immediately. If requirements exist, kicks off background
+    thread for pip install and returns env_status="pending".
+    Returns (tool, status_message).
+    """
     tool = DynamicToolORM(
         name=name,
         description=description,
         parameters_schema=json.dumps(parameters_schema),
         code=code,
         requirements=json.dumps(requirements),
-        env_status="pending",
-        created_at=now,
-        updated_at=now,
-        created_by_session_id=session_id,
+        env_status="pending" if requirements else "ready",
+        created_at=_now(),
+        updated_at=_now(),
         tags=json.dumps(tags) if tags else None,
     )
     db.add(tool)
     db.commit()
     db.refresh(tool)
-    
-    # Create the tool's virtual environment (async in production)
-    result = create_tool_environment(name, requirements)
-    if result["ok"]:
-        tool.env_status = "ready"
+
+    if requirements:
+        threading.Thread(
+            target=_setup_env_background,
+            args=(tool.id, tool.name, requirements),
+            daemon=True,
+        ).start()
+        msg = (
+            f"Tool '{name}' created. Installing {len(requirements)} package(s) "
+            f"in background: {', '.join(requirements)}. "
+            f"Check status with list_dynamic_tools before running."
+        )
     else:
-        tool.env_status = "failed"
-        tool.env_error = result["error"]
-    
-    db.commit()
-    db.refresh(tool)
-    return tool
+        msg = f"Tool '{name}' created and ready (no additional packages needed)."
+
+    return tool, msg
+
 
 def get_dynamic_tool_by_name(db: Session, name: str) -> Optional[DynamicToolORM]:
     return db.query(DynamicToolORM).filter(DynamicToolORM.name == name).first()
 
-def list_dynamic_tools(db: Session) -> List[DynamicToolORM]:
-    return db.query(DynamicToolORM).all()
+
+def list_dynamic_tools(db: Session) -> list[DynamicToolORM]:
+    return db.query(DynamicToolORM).order_by(DynamicToolORM.name).all()
+
 
 def increment_usage(db: Session, tool_id: int) -> None:
     tool = db.query(DynamicToolORM).filter(DynamicToolORM.id == tool_id).first()
     if tool:
         tool.usage_count += 1
-        tool.last_used_at = datetime.utcnow().isoformat()
+        tool.last_used_at = _now()
         db.commit()
+
 
 def delete_dynamic_tool(db: Session, name: str) -> bool:
     tool = get_dynamic_tool_by_name(db, name)
     if tool:
-        delete_tool_environment(name)  # Remove the venv
+        delete_tool_environment(name)
         db.delete(tool)
         db.commit()
         return True
     return False
+
+
+def ensure_tool_environments() -> None:
+    """Fix 1+9: called at startup to recreate any venvs missing due to redeploy."""
+    with SessionLocal() as db:  # fix 9: own session, not a free variable
+        tools = db.query(DynamicToolORM).filter(DynamicToolORM.env_status == "ready").all()
+        missing = [(t.id, t.name, json.loads(t.requirements)) for t in tools
+                   if not environment_exists(t.name)]
+
+    for tool_id, tool_name, reqs in missing:
+        print(f"[startup] Recreating missing venv for tool '{tool_name}'...")
+        threading.Thread(
+            target=_setup_env_background,
+            args=(tool_id, tool_name, reqs),
+            daemon=True,
+        ).start()
 ```
 
-### 5. Tool Schema Additions
+---
 
-**File: [backend/app/agent/tools.py](backend/app/agent/tools.py)**
+## Step 5 — Tool Schemas (`agent/tools.py`)
 
-Add new tool schemas to `TOOLS` list:
+Add to `TOOLS` list:
 
 ```python
 {
     "type": "function",
     "function": {
         "name": "create_dynamic_tool",
-        "description": "Create a reusable Python tool with its own isolated environment. Specify the required packages and they will be installed in a dedicated virtual environment for this tool.",
+        "description": (
+            "Create a reusable Python tool stored in the database with its own isolated environment. "
+            "Specify required packages and they will be installed in the background. "
+            "Check env_status with list_dynamic_tools before running a tool with packages."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Snake_case tool name (e.g., 'calculate_fte_gap')"
-                },
-                "description": {
-                    "type": "string",
-                    "description": "What the tool does"
-                },
-                "parameters_schema": {
-                    "type": "object",
-                    "description": "JSON Schema for the tool's parameters"
-                },
-                "code": {
-                    "type": "string",
-                    "description": "Python function code. Must define a function with the same name as the tool."
-                },
+                "name": {"type": "string", "description": "snake_case name, e.g. 'calculate_fte_gap'"},
+                "description": {"type": "string", "description": "What the tool does"},
+                "parameters_schema": {"type": "object", "description": "JSON Schema for the function's parameters"},
+                "code": {"type": "string", "description": "Python code. Must define a function with the same name as the tool."},
                 "requirements": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Python packages to install (e.g., ['pandas==2.2.3', 'scipy>=1.11.0'])"
+                    "description": "Packages to install, e.g. ['gurobipy', 'pandas==2.2.3']. Empty list if none needed.",
                 },
-                "tags": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional tags for categorization"
-                }
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags"},
             },
-            "required": ["name", "description", "parameters_schema", "code", "requirements"]
-        }
-    }
+            "required": ["name", "description", "parameters_schema", "code", "requirements"],
+        },
+    },
 },
 {
     "type": "function",
     "function": {
         "name": "list_dynamic_tools",
-        "description": "List all available dynamic tools that have been created, including their environment status.",
-        "parameters": {"type": "object", "properties": {}}
-    }
+        "description": "List all dynamic tools, their env_status (pending/ready/failed), and usage count.",
+        "parameters": {"type": "object", "properties": {}},
+    },
 },
 {
     "type": "function",
@@ -387,260 +373,196 @@ Add new tool schemas to `TOOLS` list:
         "parameters": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Name of the tool to delete"}
+                "name": {"type": "string", "description": "Tool name to delete"},
             },
-            "required": ["name"]
-        }
-    }
-}
+            "required": ["name"],
+        },
+    },
+},
 ```
 
-Add to `READ_ONLY_TOOLS`: `"list_dynamic_tools"`
+Add `"list_dynamic_tools"` to `READ_ONLY_TOOLS`.
 
-### 6. Executor Integration
+---
 
-**File: [backend/app/agent/executor.py](backend/app/agent/executor.py)**
+## Step 6 — Executor Integration (`agent/executor.py`)
 
-Add execution functions and update dispatch:
-
+Add imports:
 ```python
+import json
 from .dynamic_tools import (
-    get_dynamic_tool_by_name,
-    create_dynamic_tool as db_create_dynamic_tool,
-    list_dynamic_tools as db_list_dynamic_tools,
-    delete_dynamic_tool as db_delete_dynamic_tool,
-    increment_usage,
+    RESERVED_NAMES, validate_tool_code,
+    create_dynamic_tool, get_dynamic_tool_by_name,
+    list_dynamic_tools, delete_dynamic_tool, increment_usage,
 )
 from .sandbox import execute_in_sandbox
-import json
-import ast
+```
 
-def _validate_code_syntax(code: str, function_name: str) -> Optional[str]:
-    """Validate Python code syntax. Returns error message or None if valid."""
-    try:
-        tree = ast.parse(code)
-        # Check that a function with the expected name exists
-        func_names = [node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]
-        if function_name not in func_names:
-            return f"Code must define a function named '{function_name}'"
-        return None
-    except SyntaxError as e:
-        return f"Syntax error: {e}"
+Add four handler functions:
 
-def _execute_create_dynamic_tool(db, args, session_id) -> str:
+```python
+def _execute_create_dynamic_tool(db: Session, args: dict) -> str:
     name = args["name"]
-    code = args["code"]
-    
-    # Validate code syntax
-    error = _validate_code_syntax(code, name)
-    if error:
-        return f"ERROR: {error}"
-    
-    # Check if tool already exists
+    # fix 8: block reserved names
+    if name in RESERVED_NAMES:
+        return f"ERROR: '{name}' is a reserved tool name and cannot be used"
     if get_dynamic_tool_by_name(db, name):
-        return f"ERROR: Tool '{name}' already exists"
-    
-    tool = db_create_dynamic_tool(
-        db=db,
-        name=name,
-        description=args["description"],
+        return f"ERROR: Tool '{name}' already exists. Delete it first to recreate."
+    err = validate_tool_code(args["code"], name)
+    if err:
+        return f"ERROR: {err}"
+    _, msg = create_dynamic_tool(
+        db, name=name, description=args["description"],
         parameters_schema=args["parameters_schema"],
-        code=code,
-        requirements=args.get("requirements", []),
-        session_id=session_id,
+        code=args["code"], requirements=args.get("requirements", []),
         tags=args.get("tags"),
     )
-    
-    if tool.env_status == "failed":
-        return f"ERROR: Tool created but environment setup failed: {tool.env_error}"
-    
-    return f"OK: Created tool '{name}' with environment status: {tool.env_status}"
+    return f"OK: {msg}"
 
-def _execute_list_dynamic_tools(db) -> str:
-    tools = db_list_dynamic_tools(db)
+
+def _execute_list_dynamic_tools(db: Session) -> str:
+    tools = list_dynamic_tools(db)
     if not tools:
-        return "OK: No dynamic tools have been created yet."
-    
-    lines = ["OK: Available dynamic tools:"]
+        return "OK: No dynamic tools created yet."
+    lines = ["OK: Dynamic tools:"]
     for t in tools:
         reqs = json.loads(t.requirements) if t.requirements else []
-        lines.append(f"- {t.name}: {t.description}")
-        lines.append(f"  Requirements: {', '.join(reqs) if reqs else 'none'}")
-        lines.append(f"  Status: {t.env_status}, Used: {t.usage_count} times")
+        req_str = f" [{', '.join(reqs)}]" if reqs else ""
+        lines.append(f"  - {t.name}: {t.description}")
+        lines.append(f"    status={t.env_status}{req_str}, used={t.usage_count}x")
+        if t.env_status == "failed" and t.env_error:
+            lines.append(f"    error: {t.env_error}")
     return "\n".join(lines)
 
-def _execute_delete_dynamic_tool(db, args) -> str:
-    name = args["name"]
-    if db_delete_dynamic_tool(db, name):
-        return f"OK: Deleted tool '{name}' and its environment"
-    return f"ERROR: Tool '{name}' not found"
 
-def _execute_dynamic_tool(db, tool: DynamicToolORM, args: dict) -> str:
-    if tool.env_status != "ready":
-        return f"ERROR: Tool environment not ready (status: {tool.env_status})"
-    
+def _execute_delete_dynamic_tool(db: Session, args: dict) -> str:
+    name = args["name"]
+    return f"OK: Deleted tool '{name}'" if delete_dynamic_tool(db, name) \
+        else f"ERROR: Tool '{name}' not found"
+
+
+def _execute_run_dynamic_tool(db: Session, tool: DynamicToolORM, args: dict) -> str:
+    if tool.env_status == "pending":
+        return f"ERROR: Tool '{tool.name}' is still installing packages. Try again shortly."
+    if tool.env_status == "failed":
+        return f"ERROR: Tool '{tool.name}' environment setup failed: {tool.env_error}"
     result = execute_in_sandbox(tool.name, tool.code, tool.name, args)
     increment_usage(db, tool.id)
-    
-    if result["ok"]:
-        return f"OK: {result['result']}"
-    return f"ERROR: {result['error']}"
-
-def _dispatch_tool(fn_name, args, db, user_id=None, session_id=None):
-    match fn_name:
-        # ... existing cases ...
-        case "create_dynamic_tool":
-            return _execute_create_dynamic_tool(db, args, session_id)
-        case "list_dynamic_tools":
-            return _execute_list_dynamic_tools(db)
-        case "delete_dynamic_tool":
-            return _execute_delete_dynamic_tool(db, args)
-        case _:
-            # Check dynamic tools before returning error
-            tool = get_dynamic_tool_by_name(db, fn_name)
-            if tool:
-                return _execute_dynamic_tool(db, tool, args)
-            return f"ERROR: Unknown tool '{fn_name}'"
+    return f"OK: {result['result']}" if result["ok"] else f"ERROR: {result['error']}"
 ```
 
-### 7. Railway Configuration
-
-**New file: [backend/Dockerfile](backend/Dockerfile)**
-
-Railway currently uses nixpacks. Switch to Dockerfile for environment management:
-
-```dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-
-# System dependencies for building Python packages
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ libpq-dev python3-dev && rm -rf /var/lib/apt/lists/*
-
-# Main app dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Create directory for per-tool sandbox environments
-RUN mkdir -p /sandbox-envs && chmod 755 /sandbox-envs
-ENV SANDBOX_ENVS_DIR=/sandbox-envs
-
-# Copy application
-COPY . .
-
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
-**Key points:**
-- No pre-built sandbox venv - environments are created dynamically per tool
-- `/sandbox-envs/` directory holds all tool-specific venvs
-- Build tools (gcc, g++, python3-dev) included for compiling packages like numpy/scipy
-
-**Update: [backend/railway.toml](backend/railway.toml)**
-
-```toml
-[build]
-builder = "dockerfile"
-dockerfilePath = "Dockerfile"
-
-[deploy]
-startCommand = "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
-```
-
-### 8. Context Update
-
-**File: [backend/app/agent/context.py](backend/app/agent/context.py)**
-
-Add dynamic tools to system prompt so the agent knows what's available:
+Update `_dispatch_tool` — add cases before `case _:`, and change the fallback:
 
 ```python
-from .dynamic_tools import list_dynamic_tools
-import json
-
-def build_system_prompt(db: Session, ...):
-    # ... existing code ...
-    
-    # Add dynamic tools section
-    dynamic_tools = list_dynamic_tools(db)
-    if dynamic_tools:
-        lines.append("\n## Available Dynamic Tools")
-        lines.append("These are custom tools that have been created. You can call them directly by name.")
-        for t in dynamic_tools:
-            if t.env_status == "ready":
-                reqs = json.loads(t.requirements) if t.requirements else []
-                lines.append(f"- {t.name}: {t.description}")
-                if reqs:
-                    lines.append(f"  (packages: {', '.join(reqs)})")
+case "create_dynamic_tool":
+    return _execute_create_dynamic_tool(db, args)
+case "list_dynamic_tools":
+    return _execute_list_dynamic_tools(db)
+case "delete_dynamic_tool":
+    return _execute_delete_dynamic_tool(db, args)
+case _:
+    tool = get_dynamic_tool_by_name(db, fn_name)
+    if tool:
+        return _execute_run_dynamic_tool(db, tool, args)
+    return f"ERROR: Unknown tool '{fn_name}'"
 ```
 
-## Security Considerations
+---
 
-- **Per-tool isolation**: Each tool runs in its own venv with only its declared dependencies
-- **No shared state**: Tools cannot access each other's environments
-- **No DB access**: Tool venvs have no SQLAlchemy/psycopg2 - cannot connect to database
-- **No network by default**: Don't install requests/httpx unless explicitly needed
-- **No API keys**: Environment variables from main app are not passed to subprocess (`env={}`)
-- **Resource limits**: CPU time (10s), memory (256MB), execution timeout (30s)
-- **Code validation**: Syntax check and function name verification before storing
-- **Disk space**: Consider adding cleanup for unused tool environments
+## Step 7 — System Prompt Injection (`agent/context.py`)
 
-## Storage Considerations
-
-**Railway disk persistence:**
-- Railway containers have ephemeral filesystems by default
-- Tool venvs in `/sandbox-envs/` will be lost on redeploy
-- Options:
-  1. **Recreate on startup**: Add startup logic to recreate venvs for all tools with `env_status="ready"`
-  2. **Railway Volume**: Attach a persistent volume to `/sandbox-envs/` (recommended for production)
-  3. **Accept rebuild time**: First execution after deploy recreates the venv
-
-**Recommended approach**: Add a startup task that checks for missing venvs and recreates them:
+Fix 7: exact injection matching the actual `build_system_prompt` string structure.
+`build_system_prompt` returns an f-string that ends with `{_memory_section(...)}{_summary_section(...)}`.
+Add a new helper and inject it at the end of the return value:
 
 ```python
-# In main.py lifespan or startup event
-async def ensure_tool_environments():
-    """Recreate any missing tool environments on startup."""
-    tools = db_list_dynamic_tools(db)
-    for tool in tools:
-        if tool.env_status == "ready" and not environment_exists(tool.name):
-            requirements = json.loads(tool.requirements)
-            result = create_tool_environment(tool.name, requirements)
-            if not result["ok"]:
-                tool.env_status = "failed"
-                tool.env_error = result["error"]
-                db.commit()
+from .dynamic_tools import list_dynamic_tools as _list_dyn_tools
+import json as _json
+
+def _dynamic_tools_section(db: Session) -> str:
+    tools = [t for t in _list_dyn_tools(db) if t.env_status == "ready"]
+    if not tools:
+        return ""
+    lines = ["\n## Available custom dynamic tools (call by name)"]
+    for t in tools:
+        params = _json.loads(t.parameters_schema).get("properties", {})
+        param_str = ", ".join(params.keys()) if params else "no parameters"
+        lines.append(f"  - {t.name}({param_str}): {t.description}")
+    return "\n".join(lines) + "\n"
 ```
 
-## Testing Strategy
+In `build_system_prompt`, change the return to:
+```python
+    return f"""...(existing f-string)...
+{_memory_section(db, user_id)}{_summary_section(context_summary)}{_dynamic_tools_section(db)}"""
+```
 
-1. Unit tests for `env_manager.py` - venv creation/deletion
-2. Unit tests for `sandbox.py` - code execution with various inputs
-3. Integration tests for full create/execute/delete flow
-4. Test resource limit enforcement (infinite loop, memory bomb)
-5. Test environment isolation (tool A can't access tool B's packages)
-6. Test startup recovery (recreate missing venvs)
+Only `env_status == "ready"` tools are shown — pending/failed tools are not advertised to the agent.
 
-## Future Enhancements (Not in Scope)
+---
 
-- Tool promotion CLI to generate static tool code
-- Tool versioning and rollback
-- Async environment creation (background task)
-- Environment caching/sharing for common requirement sets
-- User ratings and feedback
-- Automatic tool suggestions based on query patterns
+## Step 8 — Startup Recovery (`main.py`)
 
-## Implementation Checklist
+Fix 1+2+9: call `ensure_tool_environments()` in the existing `lifespan` hook.
 
-- [ ] Add DynamicToolORM model to orm_models.py (with requirements, env_status fields)
-- [ ] Create database migration for dynamic_tools table
-- [ ] Create env_manager.py for per-tool venv management
-- [ ] Create sandbox.py with subprocess execution logic
-- [ ] Create dynamic_tools.py with CRUD operations
-- [ ] Add create_dynamic_tool, list_dynamic_tools, delete_dynamic_tool schemas to tools.py
-- [ ] Update executor.py with new tool handlers and dispatch logic
-- [ ] Create Dockerfile with /sandbox-envs directory
-- [ ] Update railway.toml to use Dockerfile builder
-- [ ] Add startup task to recreate missing tool environments
-- [ ] Update context.py to include dynamic tools in system prompt
-- [ ] Add tests for environment management and sandbox execution
+```python
+from .agent.dynamic_tools import ensure_tool_environments
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Base.metadata.create_all(bind=engine)
+    seed()
+    with SessionLocal() as db:
+        bootstrap_admin(db)
+    ensure_tool_environments()  # spawns background threads; returns immediately
+    yield
+```
+
+`ensure_tool_environments` only recreates venvs for tools marked `env_status="ready"` whose filesystem path is missing — safe no-op if all venvs exist.
+
+---
+
+## Step 9 — Railway Volume Configuration (Fix 2)
+
+One-time setup in the Railway dashboard:
+
+1. **Railway dashboard → your backend service → Settings → Volumes**
+2. Click **Add Volume**
+3. Set mount path: `/sandbox-envs`
+4. Set size: start with 5 GB (enough for dozens of tool venvs)
+5. Deploy — Railway persists the volume across all future redeploys
+
+Add `SANDBOX_ENVS_DIR=/sandbox-envs` to Railway environment variables (matches the default in `env_manager.py`).
+
+No code changes required for this step — the path is already the default in `env_manager.py`.
+
+---
+
+## What Changed vs. Original Plan
+
+| Original | Revised |
+|----------|---------|
+| `create_tool_environment` called synchronously (blocks loop) | Called in `threading.Thread`; returns "pending" immediately (fix 1) |
+| Startup recovery used `db` free variable | Uses `with SessionLocal() as db:` (fix 9) |
+| `env={}` in subprocess | `env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"}` (fix 4) |
+| `resource.setrlimit` | Removed entirely (fix 5) |
+| `python_version` ORM field | Removed (fix 6) |
+| `created_by_session_id` FK | Removed — not available at dispatch call site (fix 3) |
+| No name collision guard | `RESERVED_NAMES` check before creation (fix 8) |
+| `context.py` injection handwavy | Exact `_dynamic_tools_section()` helper with correct injection point (fix 7) |
+| `os.unlink` outside `finally` | Moved to `finally` block (fix 10) |
+| Railway persistence: documented but not implemented | Railway Volume config steps provided (fix 2) |
+
+---
+
+## Verification
+
+1. Create a tool with no requirements → `env_status="ready"` immediately, can run right away
+2. Create a tool with `requirements=["pandas"]` → `env_status="pending"` returned instantly; poll `list_dynamic_tools` until `ready`; run it
+3. Create a tool named `set_assignment` → should get `ERROR: reserved tool name`
+4. Create a tool with a syntax error → should get `ERROR: Syntax error` before any DB write
+5. Create a tool where the function name doesn't match the tool name → should get `ERROR: Code must define a function named '...'`
+6. Call a tool that is `env_status="pending"` → should get `ERROR: still installing packages`
+7. Redeploy the backend → venvs for `ready` tools automatically recreated in background via `ensure_tool_environments`
+8. Confirm dynamic tools section appears in system prompt only for `ready` tools
+9. Confirm tools with `requirements=["gurobipy"]` run in their own venv (gurobipy not importable in main app)
